@@ -53,12 +53,14 @@ def fetch_tokens():
     if not CHAIN:
         return []
 
-    url = f"https://api.dexscreener.com/latest/dex/search?q={CHAIN}"
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN}"
     response = requests.get(url)
     if response.status_code != 200:
         print("❌ API error:", response.text)
         return []
+
     return response.json().get("pairs", [])
+
 
 # ---- CHECK NEW TOKENS ----
 def check_new_tokens(context: ContextTypes.DEFAULT_TYPE):
