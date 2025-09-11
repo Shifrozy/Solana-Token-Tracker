@@ -2,70 +2,53 @@ import os
 import time
 import requests
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from datetime import datetime, timezone
 
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# Track seen tokens
-seen_tokens = set()
-AGE_FILTER = None   # set by user input
-CHAIN = None        # set by user input (e.g., solana, ethereum, bsc)
+# Global vars
+AGE_FILTER = None   # in hours
+CHAIN = None        # solana / ethereum / etc
+seen_tokens = set() # track already alerted
 
-
-# -------------------------------
-# Telegram Bot Handlers
-# -------------------------------
-
+# ---- START ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "First, choose which chain you want to monitor.\n"
-        "Example: send `solana`, `ethereum`, or `bsc`.\n\n"
-        "After that, enter how many hours old tokens you want (e.g., 24, 72, 168)."
-    )
+    keyboard = [
+        [
+            InlineKeyboardButton("Solana", callback_data="chain_solana"),
+            InlineKeyboardButton("Ethereum", callback_data="chain_ethereum"),
+        ]
+    ]
+    await update.message.reply_text("👋 Select blockchain:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ---- BUTTON ----
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CHAIN, AGE_FILTER
+    query = update.callback_query
+    await query.answer()
 
-async def set_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AGE_FILTER, CHAIN
-    text = update.message.text.strip().lower()
+    data = query.data
+    if data.startswith("chain_"):
+        CHAIN = data.split("_")[1]
+        keyboard = [
+            [
+                InlineKeyboardButton("24H", callback_data="age_24"),
+                InlineKeyboardButton("72H", callback_data="age_72"),
+                InlineKeyboardButton("168H", callback_data="age_168"),
+            ]
+        ]
+        await query.edit_message_text(f"✅ Selected chain: {CHAIN}\nNow choose max token age:", 
+                                      reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("age_"):
+        AGE_FILTER = int(data.split("_")[1])
+        await query.edit_message_text(f"✅ Selected chain: {CHAIN}\n✅ Selected age filter: {AGE_FILTER} hours\n\n🤖 Bot is now tracking tokens...")
 
-    # Step 1: Set chain
-    if text in ["solana", "ethereum", "bsc"]:
-        CHAIN = text
-        await update.message.reply_text(f"✅ Chain set to: {CHAIN.capitalize()}")
-        return
-
-    # Step 2: Set age filter
-    try:
-        hours = int(text)
-        if hours <= 0:
-            raise ValueError
-        AGE_FILTER = hours
-        await update.message.reply_text(
-            f"✅ Age filter set: tracking tokens ≤ {AGE_FILTER} hours old."
-        )
-    except ValueError:
-        await update.message.reply_text(
-            "⚠️ Please enter either:\n"
-            "- A valid chain name (`solana`, `ethereum`, `bsc`)\n"
-            "- Or a number of hours (24, 72, 168)"
-        )
-
-
-# -------------------------------
-# DexScreener Token Fetch
-# -------------------------------
-
+# ---- FETCH TOKENS ----
 def fetch_tokens():
     if not CHAIN:
         return []
@@ -77,76 +60,63 @@ def fetch_tokens():
         return []
     return response.json().get("pairs", [])
 
-
-async def check_new_tokens(context: ContextTypes.DEFAULT_TYPE):
-    global seen_tokens, AGE_FILTER, CHAIN
-    if AGE_FILTER is None or CHAIN is None:
-        # Skip if user hasn't set chain and filter yet
+# ---- CHECK NEW TOKENS ----
+def check_new_tokens(context: ContextTypes.DEFAULT_TYPE):
+    if not CHAIN or not AGE_FILTER:
         return
 
     pairs = fetch_tokens()
     if not pairs:
         return
 
-    now = time.time()
+    now = datetime.now(timezone.utc)
 
     for pair in pairs:
         token_address = pair["baseToken"]["address"]
-        created_at = pair.get("pairCreatedAt")  # reliable field in ms
+        created_at = pair.get("pairCreatedAt")  # in ms
 
-        # Skip if already seen
-        if token_address in seen_tokens:
+        if not created_at:
             continue
 
-        # Apply age filter
-        token_age_hours = None
-        if created_at:
-            token_age_hours = (now - (created_at / 1000)) / 3600
-            if token_age_hours > AGE_FILTER:
-                continue
+        created_dt = datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
+        age_hours = (now - created_dt).total_seconds() / 3600
 
+        # ✅ filter by user selection
+        if age_hours > AGE_FILTER:
+            continue
+
+        if token_address in seen_tokens:
+            continue
         seen_tokens.add(token_address)
 
-        # Detect chain (for display)
-        chain = pair.get("chainId", "Unknown").capitalize()
-
+        # prepare message
         name = pair["baseToken"]["name"]
         symbol = pair["baseToken"]["symbol"]
         url = pair["url"]
+        chain = pair["chainId"].capitalize()
 
         message = (
             f"🚀 <b>New {chain} Pair Detected!</b>\n\n"
             f"<b>Name:</b> {name}\n"
             f"<b>Symbol:</b> {symbol}\n"
+            f"<b>Age:</b> {age_hours:.2f} hours\n"
+            f"<b>Chart:</b> {url}"
         )
 
-        if token_age_hours is not None:
-            message += f"<b>Age:</b> {round(token_age_hours, 2)} hours\n"
+        context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML")
+        print("✅ Alert sent:", name, symbol, f"({age_hours:.1f}h old)")
 
-        message += f"<b>Chart:</b> {url}"
-
-        await context.bot.send_message(
-            chat_id=CHAT_ID, text=message, parse_mode="HTML"
-        )
-        print("✅ Alert sent:", name, symbol, f"({chain})")
-
-
-# -------------------------------
-# Main Runner
-# -------------------------------
-
+# ---- MAIN ----
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_user_input))
+    app.add_handler(CallbackQueryHandler(button))
 
-    # Faster background job → check every 15 seconds
-    app.job_queue.run_repeating(check_new_tokens, interval=15, first=5)
+    app.job_queue.run_repeating(check_new_tokens, interval=60, first=10)
 
-    print("🤖 Bot started! Waiting for user to set chain + age filter...")
+    print("🤖 Bot started! Waiting for /start ...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
